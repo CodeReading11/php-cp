@@ -53,9 +53,9 @@ extern "C" {
 #define CP_CONNECT_PING          2
 
 #define CPGC                     ConProxyG.conf
-#define CPGL                     ConProxyG
-#define CPGS                     ConProxyGS
-#define CPWG                     ConProxyWG
+#define CPGL                     ConProxyG  // 全局cpServerG
+#define CPGS                     ConProxyGS // 全局cpServerGS
+#define CPWG                     ConProxyWG // 全局cpWorkerG
 
 #define CP_UNSOCK_BUFSIZE        (4*1024*1024)
 
@@ -155,24 +155,24 @@ extern "C" {
     } cpThread;
 
     typedef struct _cpServerG {
-        uint8_t running;
-        uint8_t process_type;
+        uint8_t running;    // 运行状态
+        uint8_t process_type;   // 进程类型
 
         uint64_t wait_in_num;
         uint64_t wait_out_num;
 
-        cpConfig conf;
+        cpConfig conf;  // 全局配置
         int epfd;
         void *ping_mem_addr;
     } cpServerG;
 
     typedef struct _cpGroup {
-        int id; //Current worker group  id 0,1,2,3...n
-        uint32_t worker_num;
-        uint32_t worker_min;
-        uint32_t worker_max;
-        cpWorker workers[CP_GROUP_LEN];
-        volatile_int8 workers_status[CP_GROUP_LEN];
+        int id; // group id
+        uint32_t worker_num;    // worker数量
+        uint32_t worker_min;    // 最小worker数量
+        uint32_t worker_max;    // 最大worker数量
+        cpWorker workers[CP_GROUP_LEN]; // worker数组
+        volatile_int8 workers_status[CP_GROUP_LEN]; // worker状态数组
         pthread_mutex_t mutex_lock;
         int first_wait_id; //server fd
         int last_wait_id; //server fd
@@ -186,29 +186,29 @@ extern "C" {
     } cpGroup;
 
     typedef struct _cpServerGS {
-        pid_t master_pid;
-        pid_t manager_pid;
+        pid_t master_pid;   // Master进程ID
+        pid_t manager_pid;  // Manager进程ID
 
 
-        uint32_t connect_count;
+        uint32_t connect_count; // 客户端总连接数
         uint16_t reactor_next_i;
         //        uint16_t reactor_round_i;
 
-        cpConnection conlist[CP_MAX_FDS];
+        cpConnection conlist[CP_MAX_FDS];   // 客户端连接数组
 
-        cpWorker *ping_workers;
+        cpWorker *ping_workers; // ping worker数组，存储在共享内存中
 
-        cpThread *reactor_threads;
+        cpThread *reactor_threads;  // reactor线程数组，存储在共享内存中
 
-        int running;
-        cpGroup G[CP_GROUP_NUM]; //group TODO extend
+        int running;    // 是否在运行
+        cpGroup G[CP_GROUP_NUM]; // worker group，一个DSN配置对应一个group
         zval* group;
-        int group_num;
+        int group_num;  // group数量
         int max_buffer_len;
         int max_hold_time_to_log;
         int max_data_size_to_log;
 
-        pthread_mutex_t mutex_lock;
+        pthread_mutex_t mutex_lock; // 多线程互斥锁
         //        int (*global_lock)(struct _cpGroup *);
         //        int (*global_unLock)(struct _cpGroup *);
 

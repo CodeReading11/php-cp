@@ -14,11 +14,11 @@ extern "C" {
 #define CP_WORKER_SENDTO_YIELD     10   //yield after sendto
     
     typedef struct _cpWorker {
-        int request; //worker request NUM
+        int request; // worker进程处理的请求数
         pid_t pid;
-        int pipe_fd_write;
-        int CPid;//当前worker服务于哪个pid
-        cpShareMemory sm_obj;
+        int pipe_fd_write;  // write fifo
+        int CPid;// 当前worker服务于哪个pid
+        cpShareMemory sm_obj;   // 共享内存
     } cpWorker;
 
     int cpFork_one_worker(int id,int gid);

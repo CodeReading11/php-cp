@@ -45,6 +45,7 @@ static void cpWorker_init(int worker_id, int group_id)
     CPWG.gid = group_id;
     CPWG.pid = getpid();
 
+    // 创建两个命名管道，一个read，一个write
     char fifo_name[CP_FIFO_NAME_LEN] = {0};
     sprintf(fifo_name, "%s_%d", CP_FIFO_NAME_PRE, CP_WORKER_ID(group_id, worker_id)); //client 2 worker
     CPWG.pipe_fd_read = cpCreateFifo(fifo_name);
@@ -56,16 +57,24 @@ static void cpWorker_init(int worker_id, int group_id)
 
 static int cpWorker_loop(int worker_id, int group_id)
 {
+    /*
+     * worker进程初始化
+     *
+     * 创建命名管道，一个用于read，一个用于write
+     */
     cpWorker_init(worker_id, group_id);
+
     cpGroup *G = &CPGS->G[group_id];
     cpShareMemory *sm_obj = &(G->workers[worker_id].sm_obj);
     int ret;
-    cpSettitle(G->name);
-    cpSignalSet(SIGALRM, cpWorker_do_ping, 1, 0);
-    cpSignalSet(SIGTERM, cpWorker_do_stop, 1, 0);
-    alarm(CPGC.ping_time);
+    cpSettitle(G->name);    // 设置进程title
+    cpSignalSet(SIGALRM, cpWorker_do_ping, 1, 0);   // 监听ping信号
+    cpSignalSet(SIGTERM, cpWorker_do_stop, 1, 0);   // 监听stop信号
+    alarm(CPGC.ping_time);  // 定时发送ping信号，触发ping操作
     //    zval *ret_value;
     //    CP_ALLOC_INIT_ZVAL(ret_value);
+
+    // 从read fifo读取数据，解析，并执行
     while (CPGS->running)
     {
         zval *ret_value;
@@ -93,6 +102,7 @@ static int cpWorker_loop(int worker_id, int group_id)
     return SUCCESS;
 }
 
+// 创建worker进程，并进入loop
 int cpFork_one_worker(int worker_id, int group_id)
 {
     int pid, ret;
@@ -359,11 +369,12 @@ int cpWorker_manager_loop()
             sleep(1);
             continue;
         }
+
+        // 等待worker进程退出
         pid = wait(&worker_exit_code);
         sigprocmask(SIG_BLOCK, &block_alarm, NULL);
         if (CPGS->running == 1 && pid > 0)
         {
-
             if (pid == CPGS->ping_workers->pid)
             {
                 cpLog("ping worker exit");

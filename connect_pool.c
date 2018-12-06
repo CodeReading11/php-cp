@@ -349,6 +349,7 @@ void send_oob2proxy(zend_resource *rsrc TSRMLS_DC)
     }
 }
 
+// 创建服务器
 PHP_FUNCTION(pool_server_create)
 {
     zval *conf = NULL;
@@ -365,13 +366,28 @@ PHP_FUNCTION(pool_server_create)
         php_error_docref(NULL TSRMLS_CC, E_ERROR, "config file error");
         RETURN_FALSE;
     }
+
+    // 读取配置文件
     conf = cpGetConfig(config_file);
+
+    /*
+     * server init
+     *
+     * 创建socket
+     * 初始化配置
+     * 初始化互斥锁，包括server互斥锁和server group互斥锁
+     */
     int sock = cpServer_init(conf, config_file);
     if (sock <= 0)
     {
         php_error_docref(NULL TSRMLS_CC, E_ERROR, "pool_server: start server fail. Error: %s [%d]", strerror(errno), errno);
     }
 
+    /*
+     * server init
+     *
+     * 初始化日志文件句柄、reactor线程数组和ping worker数组
+     */
     int ret = cpServer_create();
     if (ret < 0)
     {

@@ -137,6 +137,7 @@ int cpServer_init(zval *conf, char *ini_file)
     int ktype;
     HashTable *_ht = Z_ARRVAL_P(conf);
 
+    // 初始化CPGC全局设置
     bzero(&CPGL, sizeof (cpServerG));
     CPGC.backlog = CP_BACKLOG;
     //    CPGC.reactor_num = CP_CPU_NUM;
@@ -155,19 +156,24 @@ int cpServer_init(zval *conf, char *ini_file)
     CPGC.max_data_size_to_log = 0;
     CPGC.max_hold_time_to_log = 0;
 
+    // 创建套接字
     if ((sock = cpListen()) < 0)
     {
         printf("listen[1] fail\n");
         return FAILURE;
     }
 
+    // 创建共享内存映射文件
     if ((cp_create_mmap_dir()) < 0)
     {
         php_printf("mkdir[1] fail\n");
         return FAILURE;
     }
 
+    // 将cpServerGS存储到共享内存中，供fpm等client进程使用
     shm.size = sizeof (cpServerGS);
+
+    // 将共享内存映射到CP_SERVER_MMAP_FILE指定的文件中
     strncpy(shm.mmap_name, CP_SERVER_MMAP_FILE, strlen(CP_SERVER_MMAP_FILE));
     if (cp_create_mmap_file(&shm) == 0)
     {
@@ -187,6 +193,7 @@ int cpServer_init(zval *conf, char *ini_file)
     }
     strcpy(CPGC.ini_file, ini_file);
 
+    // 按mysql配置进行分组
     CP_HASHTABLE_FOREACH_START2(_ht, name, klen, ktype, config)
     {
         if (strcmp(name, "common") == 0)
@@ -214,6 +221,7 @@ int cpServer_init(zval *conf, char *ini_file)
     }
     CP_HASHTABLE_FOREACH_END();
 
+    // 初始化mutex互斥锁
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
@@ -230,6 +238,7 @@ int cpServer_init(zval *conf, char *ini_file)
     CPGS->max_hold_time_to_log = CPGC.max_hold_time_to_log;
     strcpy(CPGS->log_file, CPGC.log_file);
 
+    // 初始化group组互斥锁
     cpServer_init_lock();
     return sock;
 
@@ -237,6 +246,7 @@ int cpServer_init(zval *conf, char *ini_file)
 
 int cpServer_create()
 {
+    // 参数检查
     if (CPGC.reactor_num < 1 || CPGC.max_read_len >= CP_MAX_READ_LEN)
     {
         php_printf("reactor_num < 1 or max_read_len >%d\n", CP_MAX_READ_LEN);
@@ -249,7 +259,10 @@ int cpServer_create()
         return FAILURE;
     }
 
+    // 初始化日志文件句柄
     cpLog_init(CPGC.log_file);
+
+    // 创建reactor线程数组
     CPGS->reactor_threads = (cpThread*) cp_mmap_calloc(CPGC.reactor_num * sizeof (cpThread));
     if (CPGS->reactor_threads == NULL)
     {
@@ -257,6 +270,7 @@ int cpServer_create()
         return FAILURE;
     }
 
+    // 创建ping worker数组
     CPGS->ping_workers = (cpWorker*) cp_mmap_calloc(sizeof (cpWorker));
     if (CPGS->ping_workers == NULL)
     {
@@ -272,6 +286,8 @@ int cpServer_create()
 int cpServer_start(int sock)
 {
     int w, pid, ret, g;
+
+    // 是否以守护进程方式运行
     if (CPGC.daemonize > 0)
     {
         if (daemon(0, 0) < 0)
@@ -283,17 +299,21 @@ int cpServer_start(int sock)
     CPGS->master_pid = getpid();
     CPGL.process_type = CP_PROCESS_MASTER;
 
+    // 创建manager进程
     pid = fork();
     switch (pid)
     {
-            //创建manager进程
+        // manager进程
         case 0:
+            // 为每个group创建worker进程
             for (g = 0; g < CPGS->group_num; g++)
             {
                 for (w = 0; w < CPGS->G[g].worker_min; w++)
                 {
-                    //alloc了max个 但是只启动min个
+                    //创建共享内存，alloc了max个 但是只启动min个
                     ret = cpCreate_worker_mem(w, g);
+
+                    // 创建worker进程，并进入loop
                     pid = cpFork_one_worker(w, g);
                     if (pid < 0 || ret < 0)
                     {
@@ -319,10 +339,12 @@ int cpServer_start(int sock)
 
             //标识为管理进程
             CPGL.process_type = CP_PROCESS_MANAGER;
+
+            // manager loop
             ret = cpWorker_manager_loop();
             exit(ret);
             break;
-            //主进程
+        //主进程
         default:
             CPGS->manager_pid = pid;
             break;
@@ -333,7 +355,10 @@ int cpServer_start(int sock)
         }
     }
 
+    // 给master进程注册信号
     cpSignalInit();
+
+    // 由master开启reactor线程
     if (cpReactor_start(sock) < 0)
     {
         cpLog("Reactor_start[1] fail");
@@ -387,6 +412,7 @@ static int cpServer_master_onAccept(int fd)
         setsockopt(conn_fd, IPPROTO_TCP, TCP_KEEPCNT, (void *) &keep_count, sizeof (keep_count));
 #endif
 
+        // 将新接收的连接分配到连接数最少的reactor线程上
         if (CPGC.reactor_num > 1)
         {
             int i, event_num = CPGS->reactor_threads[0].event_num;
@@ -408,6 +434,8 @@ static int cpServer_master_onAccept(int fd)
         {//不能在add后做,线程安全,防止添加到reactor后马上就读到数据,这时候下面new_connect还没执行。
             conn->release = CP_FD_RELEASED;
         }
+
+        // 使用选择的reactor线程处理该连接
         if (cpEpoll_add(CPGS->reactor_threads[c_pti].epfd, conn_fd, EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLPRI) < 0)
         {
             cpLog("[Master]add event fail Errno=%d|FD=%d", errno, conn_fd);
@@ -582,9 +610,9 @@ close_fd:
     return SUCCESS;
 }
 
+// reactor线程loop
 int static cpReactor_thread_loop(int *id)
 {
-
     struct timeval timeo;
     timeo.tv_sec = CP_REACTOR_TIMEO_SEC;
     timeo.tv_usec = CP_REACTOR_TIMEO_USEC;
@@ -606,6 +634,11 @@ int static cpReactor_thread_loop(int *id)
     return SUCCESS;
 }
 
+
+/**
+ * master线程使用epoll轮询监听新连接
+ * reactor线程使用epoll轮询读取连接数据
+ */
 int static cpReactor_start(int sock)
 {
     int i;
@@ -615,6 +648,7 @@ int static cpReactor_start(int sock)
         return FAILURE;
     };
 
+    // 将master进程ID写入pid文件
     pid_init();
     set_pid(CPGS->master_pid);
 
@@ -642,6 +676,7 @@ int static cpReactor_start(int sock)
     return cpEpoll_wait(handles, &timeo, accept_epfd);
 }
 
+// 创建服务端套接字
 int static cpListen()
 {
     int sock;
