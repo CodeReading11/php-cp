@@ -327,9 +327,12 @@ void send_oob2proxy(zend_resource *rsrc TSRMLS_DC)
             {
                 conn->release = CP_FD_RELEASED;
                 if (G->first_wait_id && conn->worker_index <= G->worker_max)
-                {//wait is not null&&use queue&&use reload to reduce max maybe trigger this
+                {
+                    // 如果等待队列不为空，直接取出队列中第一个连接，并与此worker绑定
                     int wait_pid = cpPopWaitQueue(G, conn);
                     cli->unLock(G);
+
+                    // 由于等待进程pause()中，发送信号，唤醒进程
                     if (kill(wait_pid, SIGRTMIN) < 0)
                     {
                         php_printf("send sig 2 %d error. Error: %s [%d]", wait_pid, strerror(errno), errno);
@@ -339,6 +342,7 @@ void send_oob2proxy(zend_resource *rsrc TSRMLS_DC)
                 }
                 else
                 {
+                    // 队列为空，将worker标记为空闲
                     CPGS->G[conn->group_id].workers_status[conn->worker_index] = CP_WORKER_IDLE;
                     cli->unLock(G);
                 }
@@ -486,6 +490,12 @@ int CP_INTERNAL_SERIALIZE_SEND_MEM(zval *send_data, uint8_t __type)
     return SUCCESS;
 }
 
+/*
+ * 创建proxy pdo连接
+ *
+ * 如果pdo_object已经存在，直接执行PDO操作
+ * 如果不存在，先创建pdo对象，然后再执行PDO操作
+ */
 int pdo_proxy_connect(zval *args, int flag)
 {
     zval *data_source, **tmp_pass[4], *new_obj, *username, *password, *options, * ret_pdo_obj, *null_arr = NULL;
@@ -556,6 +566,7 @@ int pdo_proxy_connect(zval *args, int flag)
     return CP_FALSE;
 }
 
+// 执行PDO操作
 static void pdo_proxy_pdo(zval * args)
 {
     zval *str = NULL, *method = NULL, * ret_value = NULL;
@@ -571,6 +582,7 @@ static void pdo_proxy_pdo(zval * args)
 
         if (cp_internal_call_user_function(pdo_object, method, &ret_value, args) == FAILURE)
         {
+            // 命令执行失败
             CP_DEL_OBJ(pdo_object);
             char cp_error_str[FAILUREOR_MSG_SIZE] = {0};
             snprintf(cp_error_str, FAILUREOR_MSG_SIZE, "call pdo method( %s ) error!", Z_STRVAL_P(method));
@@ -580,11 +592,13 @@ static void pdo_proxy_pdo(zval * args)
         {
             if (EG(exception))
             {
+                // 抛出异常
                 CP_EXCEPTION_ARGS(&str);
                 char *p = strcasestr(Z_STRVAL_P(str), "server has gone away");
                 char *p2 = strcasestr(Z_STRVAL_P(str), "There is already an active transaction");
                 if (p || p2)
-                {//del reconnect and retry
+                {
+                    // 连接丢失异常，删除原连接并重连
                     cpLog("del and retry %s,%s", p, p2);
                     CP_DEL_OBJ(pdo_object);
                     pdo_proxy_connect(args, CP_CONNECT_NORMAL);
@@ -604,8 +618,10 @@ static void pdo_proxy_pdo(zval * args)
             }
             else
             {
+                // 正常返回
                 if (Z_TYPE_P(ret_value) == IS_OBJECT)
                 {
+                    // PDO操作返回的是对象
 #if PHP_MAJOR_VERSION < 7
                     char *name;
                     zend_uint name_len;
@@ -643,7 +659,8 @@ static void pdo_proxy_pdo(zval * args)
 #endif
                 }
                 else
-                {//pdo
+                {
+                    // 返回的是普通的值
                     CP_INTERNAL_SERIALIZE_SEND_MEM(ret_value, CP_SIGEVENT_TURE);
                     if (ret_value)
                     {
@@ -662,6 +679,7 @@ static void pdo_proxy_pdo(zval * args)
     }
 }
 
+// 执行PDOStatement操作
 static void pdo_proxy_stmt(zval * args)
 {
     zval *method = NULL, * ret_value = NULL;
@@ -720,10 +738,12 @@ static void pdo_dispatch(zval * args)
     {
         if (strcmp(Z_STRVAL_P(m_type), "connect") == 0)
         {
+            // PDO操作
             pdo_proxy_connect(args, CP_CONNECT_NORMAL);
         }
         else if (strcmp(Z_STRVAL_P(m_type), "PDOStatement") == 0)
         {
+            // PDOStatement操作
             pdo_proxy_stmt(args);
         }
         //        else

@@ -610,7 +610,11 @@ close_fd:
     return SUCCESS;
 }
 
-// reactor线程loop
+/*
+ * reactor loop
+ * reactor只用来接收新增worker信号以及上报fpm进程ID
+ * pdoProxy实际上是直接操作fifo进行交互，不经过reactor
+ */
 int static cpReactor_thread_loop(int *id)
 {
     struct timeval timeo;

@@ -146,6 +146,7 @@ static CPINLINE zval * cpConnect_pool_server(zval *data_source, int async)
     return zres;
 }
 
+// 和worker进程解绑
 static void release_worker(zval *object)
 {
     zend_resource *p_sock_le;
@@ -277,6 +278,12 @@ static void* get_attach_buf(int worker_id, int max, char *mm_name)
     return buf;
 }
 
+/*
+ * 将数据发送给proxy
+ *
+ * 类型，PID，数据长度通过FIFO的方式发送
+ * 实际数据通过共享内存的方式传递
+ */
 int CP_CLIENT_SERIALIZE_SEND_MEM(zval *send_data, cpClient *cli)
 {
     int pipe_fd_write = get_writefd(CONN(cli)->worker_id);
@@ -316,24 +323,26 @@ int CP_CLIENT_SERIALIZE_SEND_MEM(zval *send_data, cpClient *cli)
         php_error_docref(NULL TSRMLS_CC, E_ERROR, "write error Error: %s [%d]", strerror(errno), errno);
     }
     return SUCCESS;
-
 }
-//core logic
 
+// 给连接绑定一个worker
 static cpGroup * cpGetWorker(cpClient *cli, zval *data_source)
 {
     cpGroup *G = NULL;
     int group_id, worker_index;
     for (group_id = 0; group_id < CPGS->group_num; group_id++)
     {
+        // 匹配DSN相同的group
         if (strcmp(Z_STRVAL_P(data_source), CPGS->G[group_id].name) == 0)
         {
             G = &CPGS->G[group_id];
             cpConnection *conn = CONN(cli);
+            // 先获取互斥锁，保证并发安全
             if (cli->lock(G) == 0)
             {
                 for (worker_index = 0; worker_index < G->worker_num; worker_index++)
                 {
+                    // 有空闲的worker，直接使用
                     if (G->workers_status[worker_index] == CP_WORKER_IDLE && worker_index < G->worker_max)
                     {
                         G->workers_status[worker_index] = CP_WORKER_BUSY;
@@ -347,8 +356,10 @@ static cpGroup * cpGetWorker(cpClient *cli, zval *data_source)
                 }
                 if (conn->release == CP_FD_RELEASED)
                 {
+                    // 没有空闲的worker
                     if (G->worker_num < G->worker_max)
-                    {//add
+                    {
+                        // worker数量小于最大worker数，直接fork新worker并和连接绑定
                         conn->worker_index = G->worker_num;
                         conn->release = CP_FD_NRELEASED;
                         conn->worker_id = CP_WORKER_ID(group_id, conn->worker_index);
@@ -369,7 +380,9 @@ static cpGroup * cpGetWorker(cpClient *cli, zval *data_source)
                         }
                     }
                     else
-                    {// in queue
+                    {
+                        // worker数已经达到了最大，放到队列中
+                        // Question: 要保证worker释放之后，有限处理排队连接
                         conn->wait_fpm_pid = cpPid;
                         conn->next_wait_id = 0;
                         if (G->last_wait_id)
@@ -391,6 +404,8 @@ static cpGroup * cpGetWorker(cpClient *cli, zval *data_source)
             break;
         }
     }
+
+    // 动态添加group
     if (!G)
     {
         if (pthread_mutex_lock(&CPGS->mutex_lock) == 0)
@@ -424,24 +439,35 @@ static cpGroup * cpGetWorker(cpClient *cli, zval *data_source)
     return G;
 }
 
+/*
+ * 通过fifo给worker进程发送数据
+ *
+ * 第一次发送的时候，连接和worker还没有绑定，必须先进行绑定
+ */
 static CPINLINE int cli_real_send(cpClient **real_cli, zval *send_data)
 {
     int ret = 0;
     cpClient *cli = *real_cli;
+    // CONN宏用来获取服务端连接
     if (CONN(cli)->release == CP_FD_RELEASED)
     {
+        // 先绑定worker，再发送
         zval *data_source = NULL;
         cp_zend_hash_find(Z_ARRVAL_P(send_data), ZEND_STRS("data_source"), (void **) &data_source);
         if (manager_pid != CPGS->manager_pid)
         {//restart server
             exit(0);
         }
+
+        // 绑定
         cpGroup *G = cpGetWorker(cli, data_source);
         if (!G)
         {
             zend_throw_exception_ex(NULL, 0, "can not find datasource %s from pool.ini", Z_STRVAL_P(data_source) TSRMLS_CC);
             return -1;
         }
+
+        // 如果被放到了队列中，那么暂停进程，等worker开始处理之后再苏醒
         while (CONN(cli)->release == CP_FD_WAITING)
         {
             pause();
@@ -452,6 +478,7 @@ static CPINLINE int cli_real_send(cpClient **real_cli, zval *send_data)
     }
     else
     {
+        // 已经绑定过，直接发送
         log_write(send_data, cli);
         ret = CP_CLIENT_SERIALIZE_SEND_MEM(send_data, cli);
     }
@@ -553,8 +580,10 @@ static char* php_check_ms(char *cmd, zval *z_args, zval* object)
     }
     cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("enable_slave"), (void **) &enable_slave);
     cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("in_tran"), (void **) &in_tran);
+
+    // 如果禁用slave或者在事务中，直接返回master模式
     if (!Z_BVAL_P(enable_slave) || Z_BVAL_P(in_tran))
-    {//todo 
+    {
         return cur_type;
     }
 
@@ -610,9 +639,18 @@ int cp_system_random(int min, int max)
     return min + (random_value % (max - min + 1));
 }
 
-
-//create the pass args that pass to mysql
-
+/*
+ * 初始化发送给mysql proxy的数据
+ *
+ * type string 类型，pdo、redis或memcache
+ * method_type string connect
+ * method string 命令名，比如query, exec
+ * args array 命令参数
+ * datasource string DSN，支持master-slave主从
+ * username string 用户名
+ * password string 密码
+ * options array 连接选项
+ */
 static CPINLINE zval* create_pass_data(char* cmd, zval* z_args, zval* object, char* cur_type, zval **ret_data_source)
 {
     zval *data_source = NULL, *username = NULL, *pwd = NULL, *options = NULL, *pass_data = NULL, *zval_conf = NULL, *real_data_source_arr = NULL;
@@ -765,6 +803,14 @@ int static stmt_fetch_obj(zval *args, zend_class_entry *ce, zval *return_value)
     }
 }
 
+/*
+ * stmt数据内容
+ * data_source string DSN
+ * method_type string PdoStatement
+ * type string pdo
+ * method string 方法
+ * args array 参数
+ */
 PHP_METHOD(pdo_connect_pool_PDOStatement, __call)
 {
     zval *zres, *source_zval, *pass_data, *object, *z_args, *class_name = NULL, stmt_obj_args_dup, *async_zval;
@@ -822,6 +868,7 @@ PHP_METHOD(pdo_connect_pool_PDOStatement, __call)
     cli_real_recv(cli, async);
     if (RecvData.type == CP_SIGEVENT_EXCEPTION)
     {
+        // proxy连接执行命令的时候抛出异常，释放worker，并抛出异常
         release_worker(getThis());
         zend_throw_exception(NULL, Z_STRVAL_P(RecvData.ret_value), 0 TSRMLS_CC);
         RETVAL_BOOL(0);
@@ -875,27 +922,39 @@ PHP_METHOD(pdo_connect_pool, __call)
         RETURN_FALSE;
     }
 
+    // 根据pdoProxy async属性，确定是否是异步请求
     if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("async"), (void **) &async_zval) == SUCCESS)
     {
         async = Z_BVAL_P(async_zval);
     }
+
+    // 根据pdoProxy use_ms属性，确定是否需要使用读写分离
     if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("use_ms"), (void **) &use_ms) == SUCCESS)
     {
         cur_type = "m";
     }
     else
     {
-        cur_type = php_check_ms(cmd, z_args, object);
-        check_need_exchange(getThis(), cur_type);
+        cur_type = php_check_ms(cmd, z_args, object);   // 检查使用master还是slave
+        check_need_exchange(getThis(), cur_type);   // 是否需要切换模式，如果需要，将当前模式保存到last_type属性
     }
+
+    /*
+     * 初始化发送给proxy的数据
+     *
+     * 会根据cur_type决定最终的DSN是什么
+     */
     pass_data = create_pass_data(cmd, z_args, object, cur_type, &source_zval);
+
     cpClient *cli;
     if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("cli"), (void **) &zres) == SUCCESS)
     {
+        // 已经连接过，直接使用已有连接
         CP_ZEND_FETCH_RESOURCE_NO_RETURN(cli, cpClient*, &zres, -1, CP_RES_CLIENT_NAME, le_cli_connect_pool);
     }
     else
     {
+        // 没有连接过，创建连接，并给cli和data_source属性赋值
         zres = cpConnect_pool_server(source_zval, async);
         zend_update_property_string(pdo_connect_pool_class_entry_ptr, getThis(), ZEND_STRL("data_source"), Z_STRVAL_P(source_zval) TSRMLS_CC);
         zend_update_property(pdo_connect_pool_class_entry_ptr, getThis(), ZEND_STRL("cli"), zres TSRMLS_CC);
@@ -918,6 +977,7 @@ PHP_METHOD(pdo_connect_pool, __call)
     cli_real_recv(cli, async);
     if (RecvData.type == CP_SIGEVENT_PDO)
     {
+        // 创建一个pdo_connect_pool_PDOStatement对象，用来获取结果
         object_init_ex(return_value, pdo_connect_pool_PDOStatement_class_entry_ptr);
         zend_update_property(pdo_connect_pool_PDOStatement_class_entry_ptr, return_value, ZEND_STRL("cli"), zres TSRMLS_CC);
         zend_update_property(pdo_connect_pool_PDOStatement_class_entry_ptr, return_value, ZEND_STRL("data_source"), source_zval TSRMLS_CC); //标示这个连接的真实目标
@@ -944,6 +1004,7 @@ PHP_METHOD(pdo_connect_pool, __destruct)
 {
 }
 
+// 不进行connect操作，只是初始化pdoProxy对象属性
 PHP_METHOD(pdo_connect_pool, __construct)
 {
     zval *zval_conf = NULL, *data_source = NULL, *options = NULL, *master = NULL;
@@ -958,7 +1019,9 @@ PHP_METHOD(pdo_connect_pool, __construct)
         ZVAL_NULL(object);
         return;
     }
-    CP_GET_PID;
+    CP_GET_PID; // 初始化PID
+
+    // 构造函数DSN支持两种形式：字符串和数组
     switch (Z_TYPE_P(data_source))
     {
         case IS_STRING:
